@@ -187,12 +187,16 @@ class ViewController: UIViewController {
                 print("Face object lost, resetting detection...")
                 return
             }
-        }
-        
-        // if we made it here, then we do have valid tracking
-        //  of the initially detected face!!
             
-        
+            // if we made it here, then we do have valid tracking
+            //  of the initially detected face!!
+            
+            if let singleTrack = newTrackingRequests.last{
+                //TODO: make this update a single bounding box layer
+                print(singleTrack.inputObservation.boundingBox.origin)
+            }
+            
+        }
         
     }
     
@@ -247,7 +251,10 @@ class ViewController: UIViewController {
                 // If it is, then we should add it to processing buffer
                 // the threshold is arbitrary. You can adjust to you liking
                 if !trackingRequest.isLastFrame {
-                    if observation.confidence < 0.3 {
+                    if observation.confidence > 0.3 {
+                        trackingRequest.inputObservation = observation
+                    }
+                    else {
 
                         // once below thresh, make it last frame
                         // this will stop the processing of tracker

@@ -24,11 +24,6 @@ class ViewController: UIViewController {
     var captureDevice: AVCaptureDevice?
     var captureDeviceResolution: CGSize = CGSize()
     
-    // Layer UI for drawing Vision results
-    var rootLayer: CALayer?
-    var detectionOverlayLayer: CALayer?
-    var detectedFaceRectangleShapeLayer: CAShapeLayer?
-    var detectedFaceLandmarksShapeLayer: CAShapeLayer?
     
     // Vision requests
     private var detectionRequests: [VNDetectFaceRectanglesRequest]?
@@ -85,8 +80,6 @@ class ViewController: UIViewController {
         // setup the tracking of a sequence of features from detection
         self.sequenceRequestHandler = VNSequenceRequestHandler()
         
-        // setup drawing layers for showing output of face detection
-        self.setupVisionDrawingLayers()
     }
     
     // define behavior for when we detect a face
@@ -170,31 +163,67 @@ class ViewController: UIViewController {
             // the initial detection takes some time to perform
             // so we special case it here
             
-            // create request
-            let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                                            orientation: exifOrientation,
-                                                            options: requestHandlerOptions)
-            
-            do {
-                if let detectRequests = self.detectionRequests{
-                    // try to detect face and add it to tracking buffer
-                    try imageRequestHandler.perform(detectRequests)
-                }
-            } catch let error as NSError {
-                NSLog("Failed to perform FaceRectangleRequest: %@", error)
-            }
+            self.performInitialDetection(pixelBuffer: pixelBuffer,
+                                        exifOrientation: exifOrientation,
+                                        requestHandlerOptions: requestHandlerOptions)
             
             return  // just perform the initial request
         }
         
         // if tracking was not empty, it means we have detected a face very recently
-        // so no we can process the sequence of tracking face features
+        // so we can process the sequence of tracking face features
         
+        self.performTracking(requests: requests,
+                             pixelBuffer: pixelBuffer,
+                             exifOrientation: exifOrientation)
+        
+        
+        // if there are no valid observations, then this will be empty
+        // the function above will empty out all the elements
+        // in our tracking if nothing is high confidence in the output
+        if let newTrackingRequests = self.trackingRequests{
+            if newTrackingRequests.isEmpty {
+                // Nothing was high enough confidence to track, just abort.
+                print("Face object lost, resetting detection...")
+                return
+            }
+        }
+        
+        // if we made it here, then we do have valid tracking
+        //  of the initially detected face!!
+            
+        
+        
+    }
+    
+    // functionality to run the image detection on pixel buffer
+    // This is an involved computation, so beware of running too often
+    func performInitialDetection(pixelBuffer:CVPixelBuffer, exifOrientation:CGImagePropertyOrientation, requestHandlerOptions:[VNImageOption: AnyObject]) {
+        // create request
+        let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
+                                                        orientation: exifOrientation,
+                                                        options: requestHandlerOptions)
+        
+        do {
+            if let detectRequests = self.detectionRequests{
+                // try to detect face and add it to tracking buffer
+                try imageRequestHandler.perform(detectRequests)
+            }
+        } catch let error as NSError {
+            NSLog("Failed to perform FaceRectangleRequest: %@", error)
+        }
+    }
+    
+    
+    // this function performs all the tracking of the face sequence
+    func performTracking(requests:[VNTrackObjectRequest],
+                         pixelBuffer:CVPixelBuffer, exifOrientation:CGImagePropertyOrientation)
+    {
         do {
             // perform tracking on the pixel buffer, which is
             // less computational than fully detecting a face
             // if a face was not correct initially, this tracking
-            //   will also be not great... but its fast!
+            //   will also be not great... but it is fast!
             try self.sequenceRequestHandler.perform(requests,
                                                     on: pixelBuffer,
                                                     orientation: exifOrientation)
@@ -209,105 +238,33 @@ class ViewController: UIViewController {
         for trackingRequest in requests {
             
             // any valid results in the request?
-            guard let results = trackingRequest.results else {
-                return
-            }
-            
-            // grab the first observation in request
-            guard let observation = results[0] as? VNDetectedObjectObservation else {
-                return
-            }
-            
-            // is this tracking request of high confidence?
-            // If it is, then we should add it to processing buffer
-            // the threshold of 0.3 is arbitrary. You can adjust to you liking
-            if !trackingRequest.isLastFrame {
-                if observation.confidence > 0.3 {
-                    // overwrite the observations
-                    trackingRequest.inputObservation = observation
-                } else {
-                    // once below thresh, make it last frame
-                    // this will stop the processing on this frame
-                    trackingRequest.isLastFrame = true
+            // if so, grab the first request
+            if let results = trackingRequest.results,
+               let observation = results[0] as? VNDetectedObjectObservation {
+                
+                
+                // is this tracking request of high confidence?
+                // If it is, then we should add it to processing buffer
+                // the threshold is arbitrary. You can adjust to you liking
+                if !trackingRequest.isLastFrame {
+                    if observation.confidence < 0.3 {
+
+                        // once below thresh, make it last frame
+                        // this will stop the processing of tracker
+                        trackingRequest.isLastFrame = true
+                    }
+                    // add to running tally of high confidence observations
+                    newTrackingRequests.append(trackingRequest)
                 }
-                // add to running tally of high confidence observations
-                newTrackingRequests.append(trackingRequest)
+                
             }
+            
         }
         self.trackingRequests = newTrackingRequests
         
-        if newTrackingRequests.isEmpty {
-            // Nothing was high enough confidence to track, just abort.
-            return
-        }
-        
-        // if we made it here, then we do have valid tracking
-        //  of the initially detected face!! Let's get landmarks for it!
-        
-        // Perform face landmark tracking on detected faces.
-        // setup an empty arry for now
-        var faceLandmarkRequests = [VNDetectFaceLandmarksRequest]()
-        
-        // Perform landmark detection on tracked faces.
-        for trackingRequest in newTrackingRequests {
-            
-            // create a request for facial landmarks
-            let faceLandmarksRequest = VNDetectFaceLandmarksRequest(completionHandler: self.landmarksCompletionHandler)
-            
-            // get tracking result and observation for result
-            if let trackingResults = trackingRequest.results,
-               let observation = trackingResults[0] as? VNDetectedObjectObservation{
-                
-                // get bounding box for face
-                let faceObservation = VNFaceObservation(boundingBox: observation.boundingBox)
-                
-                // set features for the bounding box
-                faceLandmarksRequest.inputFaceObservations = [faceObservation]
-                
-                // Continue to track detected facial landmarks.
-                faceLandmarkRequests.append(faceLandmarksRequest)
-                
-                // setup for performing landmark detection
-                let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                                                orientation: exifOrientation,
-                                                                options: requestHandlerOptions)
-                
-                do {
-                    // try to find landmarks in app
-                    try imageRequestHandler.perform(faceLandmarkRequests)
-                    
-                    // completion handler will now take over and finish the job!
-                } catch let error as NSError {
-                    NSLog("Failed to perform FaceLandmarkRequest: %@", error)
-                }
-            }
-            
-            
-        }
         
     }
-    
-    
-    // Interpret the outpu of our facial landmark detector
-    // this code is called upon succesful completion of landmark detection
-    func landmarksCompletionHandler(request:VNRequest, error:Error?){
-        
-        if error != nil {
-            print("FaceLandmarks error: \(String(describing: error)).")
-        }
-        
-        // any landmarks found that we can display? If not, return
-        guard let landmarksRequest = request as? VNDetectFaceLandmarksRequest,
-              let results = landmarksRequest.results as? [VNFaceObservation] else {
-            return
-        }
-        
-        // Perform all UI updates (drawing) on the main queue, not the background queue on which this handler is being called.
-        DispatchQueue.main.async {
-            self.drawFaceObservations(results)
-        }
-    }
-    
+      
     
 }
 
@@ -466,7 +423,6 @@ extension ViewController:AVCaptureVideoDataOutputSampleBufferDelegate{
         videoPreviewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
         
         if let previewRootLayer = self.previewView?.layer {
-            self.rootLayer = previewRootLayer
             
             previewRootLayer.masksToBounds = true
             videoPreviewLayer.frame = previewRootLayer.bounds
@@ -487,193 +443,4 @@ extension ViewController:AVCaptureVideoDataOutputSampleBufferDelegate{
 }
 
 
-// MARK: Extension Drawing Vision Observations
-extension ViewController {
-    
-    
-    fileprivate func setupVisionDrawingLayers() {
-        let captureDeviceResolution = self.captureDeviceResolution
-        
-        let captureDeviceBounds = CGRect(x: 0,
-                                         y: 0,
-                                         width: captureDeviceResolution.width,
-                                         height: captureDeviceResolution.height)
-        
-        let captureDeviceBoundsCenterPoint = CGPoint(x: captureDeviceBounds.midX,
-                                                     y: captureDeviceBounds.midY)
-        
-        let normalizedCenterPoint = CGPoint(x: 0.5, y: 0.5)
-        
-        guard let rootLayer = self.rootLayer else {
-            self.presentErrorAlert(message: "view was not property initialized")
-            return
-        }
-        
-        let overlayLayer = CALayer()
-        overlayLayer.name = "DetectionOverlay"
-        overlayLayer.masksToBounds = true
-        overlayLayer.anchorPoint = normalizedCenterPoint
-        overlayLayer.bounds = captureDeviceBounds
-        overlayLayer.position = CGPoint(x: rootLayer.bounds.midX, y: rootLayer.bounds.midY)
-        
-        let faceRectangleShapeLayer = CAShapeLayer()
-        faceRectangleShapeLayer.name = "RectangleOutlineLayer"
-        faceRectangleShapeLayer.bounds = captureDeviceBounds
-        faceRectangleShapeLayer.anchorPoint = normalizedCenterPoint
-        faceRectangleShapeLayer.position = captureDeviceBoundsCenterPoint
-        faceRectangleShapeLayer.fillColor = nil
-        faceRectangleShapeLayer.strokeColor = UIColor.green.withAlphaComponent(0.7).cgColor
-        faceRectangleShapeLayer.lineWidth = 5
-        faceRectangleShapeLayer.shadowOpacity = 0.7
-        faceRectangleShapeLayer.shadowRadius = 5
-        
-        let faceLandmarksShapeLayer = CAShapeLayer()
-        faceLandmarksShapeLayer.name = "FaceLandmarksLayer"
-        faceLandmarksShapeLayer.bounds = captureDeviceBounds
-        faceLandmarksShapeLayer.anchorPoint = normalizedCenterPoint
-        faceLandmarksShapeLayer.position = captureDeviceBoundsCenterPoint
-        faceLandmarksShapeLayer.fillColor = nil
-        faceLandmarksShapeLayer.strokeColor = UIColor.yellow.withAlphaComponent(0.7).cgColor
-        faceLandmarksShapeLayer.lineWidth = 3
-        faceLandmarksShapeLayer.shadowOpacity = 0.7
-        faceLandmarksShapeLayer.shadowRadius = 5
-        
-        overlayLayer.addSublayer(faceRectangleShapeLayer)
-        faceRectangleShapeLayer.addSublayer(faceLandmarksShapeLayer)
-        rootLayer.addSublayer(overlayLayer)
-        
-        self.detectionOverlayLayer = overlayLayer
-        self.detectedFaceRectangleShapeLayer = faceRectangleShapeLayer
-        self.detectedFaceLandmarksShapeLayer = faceLandmarksShapeLayer
-        
-        self.updateLayerGeometry()
-    }
-    
-    fileprivate func updateLayerGeometry() {
-        guard let overlayLayer = self.detectionOverlayLayer,
-            let rootLayer = self.rootLayer,
-            let previewLayer = self.previewLayer
-            else {
-            return
-        }
-        
-        CATransaction.setValue(NSNumber(value: true), forKey: kCATransactionDisableActions)
-        
-        let videoPreviewRect = previewLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-        
-        var rotation: CGFloat
-        var scaleX: CGFloat
-        var scaleY: CGFloat
-        
-        // Rotate the layer into screen orientation.
-        switch UIDevice.current.orientation {
-        case .portraitUpsideDown:
-            rotation = 180
-            scaleX = videoPreviewRect.width / captureDeviceResolution.width
-            scaleY = videoPreviewRect.height / captureDeviceResolution.height
-            
-        case .landscapeLeft:
-            rotation = 90
-            scaleX = videoPreviewRect.height / captureDeviceResolution.width
-            scaleY = scaleX
-            
-        case .landscapeRight:
-            rotation = -90
-            scaleX = videoPreviewRect.height / captureDeviceResolution.width
-            scaleY = scaleX
-            
-        default:
-            rotation = 0
-            scaleX = videoPreviewRect.width / captureDeviceResolution.width
-            scaleY = videoPreviewRect.height / captureDeviceResolution.height
-        }
-        
-        // Scale and mirror the image to ensure upright presentation.
-        let affineTransform = CGAffineTransform(rotationAngle: radiansForDegrees(rotation))
-            .scaledBy(x: scaleX, y: -scaleY)
-        overlayLayer.setAffineTransform(affineTransform)
-        
-        // Cover entire screen UI.
-        let rootLayerBounds = rootLayer.bounds
-        overlayLayer.position = CGPoint(x: rootLayerBounds.midX, y: rootLayerBounds.midY)
-    }
-    
-    fileprivate func addPoints(in landmarkRegion: VNFaceLandmarkRegion2D, to path: CGMutablePath, applying affineTransform: CGAffineTransform, closingWhenComplete closePath: Bool) {
-        let pointCount = landmarkRegion.pointCount
-        if pointCount > 1 {
-            let points: [CGPoint] = landmarkRegion.normalizedPoints
-            path.move(to: points[0], transform: affineTransform)
-            path.addLines(between: points, transform: affineTransform)
-            if closePath {
-                path.addLine(to: points[0], transform: affineTransform)
-                path.closeSubpath()
-            }
-        }
-    }
-    
-    fileprivate func addIndicators(to faceRectanglePath: CGMutablePath, faceLandmarksPath: CGMutablePath, for faceObservation: VNFaceObservation) {
-        let displaySize = self.captureDeviceResolution
-        
-        let faceBounds = VNImageRectForNormalizedRect(faceObservation.boundingBox, Int(displaySize.width), Int(displaySize.height))
-        faceRectanglePath.addRect(faceBounds)
-        
-        if let landmarks = faceObservation.landmarks {
-            // Landmarks are relative to -- and normalized within --- face bounds
-            let affineTransform = CGAffineTransform(translationX: faceBounds.origin.x, y: faceBounds.origin.y)
-                .scaledBy(x: faceBounds.size.width, y: faceBounds.size.height)
-            
-            // Treat eyebrows and lines as open-ended regions when drawing paths.
-            let openLandmarkRegions: [VNFaceLandmarkRegion2D?] = [
-                landmarks.leftEyebrow,
-                landmarks.rightEyebrow,
-                landmarks.faceContour,
-                landmarks.noseCrest,
-                landmarks.medianLine
-            ]
-            for openLandmarkRegion in openLandmarkRegions where openLandmarkRegion != nil {
-                self.addPoints(in: openLandmarkRegion!, to: faceLandmarksPath, applying: affineTransform, closingWhenComplete: false)
-            }
-            
-            // Draw eyes, lips, and nose as closed regions.
-            let closedLandmarkRegions: [VNFaceLandmarkRegion2D?] = [
-                landmarks.leftEye,
-                landmarks.rightEye,
-                landmarks.outerLips,
-                landmarks.innerLips,
-                landmarks.nose
-            ]
-            for closedLandmarkRegion in closedLandmarkRegions where closedLandmarkRegion != nil {
-                self.addPoints(in: closedLandmarkRegion!, to: faceLandmarksPath, applying: affineTransform, closingWhenComplete: true)
-            }
-        }
-    }
-    
-    /// - Tag: DrawPaths
-    fileprivate func drawFaceObservations(_ faceObservations: [VNFaceObservation]) {
-        guard let faceRectangleShapeLayer = self.detectedFaceRectangleShapeLayer,
-            let faceLandmarksShapeLayer = self.detectedFaceLandmarksShapeLayer
-            else {
-            return
-        }
-        
-        CATransaction.begin()
-        
-        CATransaction.setValue(NSNumber(value: true), forKey: kCATransactionDisableActions)
-        
-        let faceRectanglePath = CGMutablePath()
-        let faceLandmarksPath = CGMutablePath()
-        
-        for faceObservation in faceObservations {
-            self.addIndicators(to: faceRectanglePath,
-                               faceLandmarksPath: faceLandmarksPath,
-                               for: faceObservation)
-        }
-        
-        faceRectangleShapeLayer.path = faceRectanglePath
-        faceLandmarksShapeLayer.path = faceLandmarksPath
-        
-        self.updateLayerGeometry()
-        
-        CATransaction.commit()
-    }
-}
+

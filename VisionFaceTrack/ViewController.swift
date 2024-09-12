@@ -199,14 +199,14 @@ class ViewController: UIViewController {
             // if we made it here, then we do have valid tracking
             //  of the initially detected face!!
             
-            DispatchQueue.main.async{
-                self.drawFaceObservations(newTrackingRequests)
-            }
+            
             
             if let singleTrack = newTrackingRequests.last{
-                //TODO: make this update a single bounding box layer
-                print(singleTrack.inputObservation.boundingBox.origin)
-                
+                                
+                // update a single bounding box layer
+                DispatchQueue.main.async{
+                    self.drawFaceRect(faceBounds: singleTrack.inputObservation.boundingBox)
+                }
                 
             }
             
@@ -517,9 +517,9 @@ extension ViewController {
     
     fileprivate func updateLayerGeometry() {
         guard let overlayLayer = self.detectionOverlayLayer,
-            let rootLayer = self.rootLayer,
-            let previewLayer = self.previewLayer
-            else {
+              let rootLayer = self.rootLayer,
+              let previewLayer = self.previewLayer
+        else {
             return
         }
         
@@ -547,10 +547,9 @@ extension ViewController {
     }
     
     
-    /// - Tag: DrawPaths
-    fileprivate func drawFaceObservations(_ faceObservations: [VNFaceObservation]) {
+    fileprivate func drawFaceRect(faceBounds:CGRect){
         guard let faceRectangleShapeLayer = self.detectedFaceRectangleShapeLayer
-            else {
+        else {
             return
         }
         
@@ -561,10 +560,8 @@ extension ViewController {
         let faceRectanglePath = CGMutablePath()
         let displaySize = self.captureDeviceResolution
         
-        for faceObservation in faceObservations {
-            let faceBounds = VNImageRectForNormalizedRect(faceObservation.boundingBox, Int(displaySize.width), Int(displaySize.height))
-            faceRectanglePath.addRect(faceBounds)
-        }
+        faceRectanglePath.addRect(faceBounds)
+        
         
         faceRectangleShapeLayer.path = faceRectanglePath
         
@@ -572,5 +569,6 @@ extension ViewController {
         
         CATransaction.commit()
     }
+    
 }
 

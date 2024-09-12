@@ -467,7 +467,9 @@ extension ViewController:AVCaptureVideoDataOutputSampleBufferDelegate{
 // MARK: Extension Drawing Vision Observations
 extension ViewController {
     
-    
+    // Special thanks to UIKit and Vision having a convoluted
+    // relationship. This makes the layer drawing more complex
+    // than it needs to be...
     fileprivate func setupVisionDrawingLayers() {
         let captureDeviceResolution = self.captureDeviceResolution
         
@@ -560,7 +562,9 @@ extension ViewController {
         let faceRectanglePath = CGMutablePath()
         let displaySize = self.captureDeviceResolution
         
-        faceRectanglePath.addRect(faceBounds)
+        let faceBoundsCorrected = VNImageRectForNormalizedRect(faceBounds, Int(displaySize.width), Int(displaySize.height))
+        
+        faceRectanglePath.addRect(faceBoundsCorrected)
         
         
         faceRectangleShapeLayer.path = faceRectanglePath

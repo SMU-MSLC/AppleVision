@@ -9,7 +9,7 @@ import UIKit
 import AVKit
 import Vision
 
-class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate {
+class ViewController: UIViewController {
     
     // Main view for showing camera content.
     @IBOutlet weak var previewView: UIView?
@@ -41,10 +41,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     override func viewDidLoad() {
         super.viewDidLoad()
         
+        // setup video for high resolution, drop frames when busy, and front camera
         self.session = self.setupAVCaptureSession()
         
+        // setup the vision objects for (1) detection and (2) tracking
         self.prepareVisionRequest()
         
+        // start the capture session and get processing a face!
         self.session?.startRunning()
     }
     
@@ -62,7 +65,299 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         return .portrait
     }
     
-    // MARK: AVCapture Setup
+    
+    
+    // MARK: Performing Vision Requests
+    
+    /// - Tag: WriteCompletionHandler
+    fileprivate func prepareVisionRequest() {
+        
+        self.trackingRequests = []
+        
+        // create a detection request that processes an image and returns face features
+        // completion handler does not run immediately, it is run
+        // after a face is detected
+        let faceDetectionRequest:VNDetectFaceRectanglesRequest = VNDetectFaceRectanglesRequest(completionHandler: self.faceDetectionCompletionHandler)
+        
+        // Save this detection request for later processing
+        self.detectionRequests = [faceDetectionRequest]
+        
+        // setup the tracking of a sequence of features from detection
+        self.sequenceRequestHandler = VNSequenceRequestHandler()
+        
+        // setup drawing layers for showing output of face detection
+        self.setupVisionDrawingLayers()
+    }
+    
+    // define behavior for when we detect a face
+    func faceDetectionCompletionHandler(request:VNRequest, error: Error?){
+        // any errors? If yes, show and try to keep going
+        if error != nil {
+            print("FaceDetection error: \(String(describing: error)).")
+        }
+        
+        // see if we can get any face features, this will fail if no faces detected
+        // try to save the face observations to a results vector
+        guard let faceDetectionRequest = request as? VNDetectFaceRectanglesRequest,
+            let results = faceDetectionRequest.results as? [VNFaceObservation] else {
+                return
+        }
+        
+        if !results.isEmpty{
+            print("Initial Face found... setting up tracking.")
+            
+            
+        }
+        
+        // if we got here, then a face was detected and we have its features saved
+        // The above face detection was the most computational part of what we did
+        // the remaining tracking only needs the results vector of face features
+        // so we can process it in the main queue (because we will us it to update UI)
+        DispatchQueue.main.async {
+            // Add the face features to the tracking list
+            for observation in results {
+                let faceTrackingRequest = VNTrackObjectRequest(detectedObjectObservation: observation)
+                // the array starts empty, but this will constantly add to it
+                // since on the main queue, there are no race conditions
+                // everything is from a single thread
+                // once we add this, it kicks off tracking in another function
+                self.trackingRequests?.append(faceTrackingRequest)
+                
+                // NOTE: if the initial face detection is actually not a face,
+                // then the app will continually mess up trying to perform tracking
+            }
+        }
+        
+    }
+    
+    
+    // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
+    /// - Tag: PerformRequests
+    // Handle delegate method callback on receiving a sample buffer.
+    // This is where we get the pixel buffer from the camera and need to
+    // generate the vision requests
+    public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        
+        var requestHandlerOptions: [VNImageOption: AnyObject] = [:]
+        
+        // see if camera has any instrinsic transforms on it
+        // if it does, add these to the options for requests
+        let cameraIntrinsicData = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil)
+        if cameraIntrinsicData != nil {
+            requestHandlerOptions[VNImageOption.cameraIntrinsics] = cameraIntrinsicData
+        }
+        
+        // check to see if we can get the pixels for processing, else return
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            print("Failed to obtain a CVPixelBuffer for the current output frame.")
+            return
+        }
+        
+        // get portrait orientation for UI
+        let exifOrientation = self.exifOrientationForCurrentDeviceOrientation()
+        
+        guard let requests = self.trackingRequests else {
+            print("Tracking request array not setup, aborting.")
+            return
+        }
+        
+        
+        
+        // check to see if the tracking request is empty (no face currently detected)
+        // if it is empty,
+        if requests.isEmpty{
+            // No tracking object detected, so perform initial detection
+            // the initial detection takes some time to perform
+            // so we special case it here
+            
+            // create request
+            let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
+                                                            orientation: exifOrientation,
+                                                            options: requestHandlerOptions)
+            
+            do {
+                if let detectRequests = self.detectionRequests{
+                    // try to detect face and add it to tracking buffer
+                    try imageRequestHandler.perform(detectRequests)
+                }
+            } catch let error as NSError {
+                NSLog("Failed to perform FaceRectangleRequest: %@", error)
+            }
+            
+            return  // just perform the initial request
+        }
+        
+        // if tracking was not empty, it means we have detected a face very recently
+        // so no we can process the sequence of tracking face features
+        
+        do {
+            // perform tracking on the pixel buffer, which is
+            // less computational than fully detecting a face
+            // if a face was not correct initially, this tracking
+            //   will also be not great... but its fast!
+            try self.sequenceRequestHandler.perform(requests,
+                                                    on: pixelBuffer,
+                                                    orientation: exifOrientation)
+        } catch let error as NSError {
+            NSLog("Failed to perform SequenceRequest: %@", error)
+        }
+        
+        // if there are any tracking results, let's process them here
+        
+        // Setup the next round of tracking.
+        var newTrackingRequests = [VNTrackObjectRequest]()
+        for trackingRequest in requests {
+            
+            // any valid results in the request?
+            guard let results = trackingRequest.results else {
+                return
+            }
+            
+            // grab the first observation in request
+            guard let observation = results[0] as? VNDetectedObjectObservation else {
+                return
+            }
+            
+            // is this tracking request of high confidence?
+            // If it is, then we should add it to processing buffer
+            // the threshold of 0.3 is arbitrary. You can adjust to you liking
+            if !trackingRequest.isLastFrame {
+                if observation.confidence > 0.3 {
+                    // overwrite the observations
+                    trackingRequest.inputObservation = observation
+                } else {
+                    // once below thresh, make it last frame
+                    // this will stop the processing on this frame
+                    trackingRequest.isLastFrame = true
+                }
+                // add to running tally of high confidence observations
+                newTrackingRequests.append(trackingRequest)
+            }
+        }
+        self.trackingRequests = newTrackingRequests
+        
+        if newTrackingRequests.isEmpty {
+            // Nothing was high enough confidence to track, just abort.
+            return
+        }
+        
+        // if we made it here, then we do have valid tracking
+        //  of the initially detected face!! Let's get landmarks for it!
+        
+        // Perform face landmark tracking on detected faces.
+        // setup an empty arry for now
+        var faceLandmarkRequests = [VNDetectFaceLandmarksRequest]()
+        
+        // Perform landmark detection on tracked faces.
+        for trackingRequest in newTrackingRequests {
+            
+            // create a request for facial landmarks
+            let faceLandmarksRequest = VNDetectFaceLandmarksRequest(completionHandler: self.landmarksCompletionHandler)
+            
+            // get tracking result and observation for result
+            if let trackingResults = trackingRequest.results,
+               let observation = trackingResults[0] as? VNDetectedObjectObservation{
+                
+                // get bounding box for face
+                let faceObservation = VNFaceObservation(boundingBox: observation.boundingBox)
+                
+                // set features for the bounding box
+                faceLandmarksRequest.inputFaceObservations = [faceObservation]
+                
+                // Continue to track detected facial landmarks.
+                faceLandmarkRequests.append(faceLandmarksRequest)
+                
+                // setup for performing landmark detection
+                let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
+                                                                orientation: exifOrientation,
+                                                                options: requestHandlerOptions)
+                
+                do {
+                    // try to find landmarks in app
+                    try imageRequestHandler.perform(faceLandmarkRequests)
+                    
+                    // completion handler will now take over and finish the job!
+                } catch let error as NSError {
+                    NSLog("Failed to perform FaceLandmarkRequest: %@", error)
+                }
+            }
+            
+            
+        }
+        
+    }
+    
+    
+    // Interpret the outpu of our facial landmark detector
+    // this code is called upon succesful completion of landmark detection
+    func landmarksCompletionHandler(request:VNRequest, error:Error?){
+        
+        if error != nil {
+            print("FaceLandmarks error: \(String(describing: error)).")
+        }
+        
+        // any landmarks found that we can display? If not, return
+        guard let landmarksRequest = request as? VNDetectFaceLandmarksRequest,
+              let results = landmarksRequest.results as? [VNFaceObservation] else {
+            return
+        }
+        
+        // Perform all UI updates (drawing) on the main queue, not the background queue on which this handler is being called.
+        DispatchQueue.main.async {
+            self.drawFaceObservations(results)
+        }
+    }
+    
+    
+}
+
+
+// MARK: Helper Methods
+extension UIViewController{
+    
+    // Helper Methods for Error Presentation
+    
+    fileprivate func presentErrorAlert(withTitle title: String = "Unexpected Failure", message: String) {
+        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        self.present(alertController, animated: true)
+    }
+    
+    fileprivate func presentError(_ error: NSError) {
+        self.presentErrorAlert(withTitle: "Failed with error \(error.code)", message: error.localizedDescription)
+    }
+    
+    // Helper Methods for Handling Device Orientation & EXIF
+    
+    fileprivate func radiansForDegrees(_ degrees: CGFloat) -> CGFloat {
+        return CGFloat(Double(degrees) * Double.pi / 180.0)
+    }
+    
+    func exifOrientationForDeviceOrientation(_ deviceOrientation: UIDeviceOrientation) -> CGImagePropertyOrientation {
+        
+        switch deviceOrientation {
+        case .portraitUpsideDown:
+            return .rightMirrored
+            
+        case .landscapeLeft:
+            return .downMirrored
+            
+        case .landscapeRight:
+            return .upMirrored
+            
+        default:
+            return .leftMirrored
+        }
+    }
+    
+    func exifOrientationForCurrentDeviceOrientation() -> CGImagePropertyOrientation {
+        return exifOrientationForDeviceOrientation(UIDevice.current.orientation)
+    }
+}
+
+
+// MARK: Extension for AVCapture Setup
+extension ViewController:AVCaptureVideoDataOutputSampleBufferDelegate{
+    
     
     /// - Tag: CreateCaptureSession
     fileprivate func setupAVCaptureSession() -> AVCaptureSession? {
@@ -189,82 +484,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             self.previewLayer = nil
         }
     }
+}
+
+
+// MARK: Extension Drawing Vision Observations
+extension ViewController {
     
-    // MARK: Helper Methods for Error Presentation
-    
-    fileprivate func presentErrorAlert(withTitle title: String = "Unexpected Failure", message: String) {
-        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
-        self.present(alertController, animated: true)
-    }
-    
-    fileprivate func presentError(_ error: NSError) {
-        self.presentErrorAlert(withTitle: "Failed with error \(error.code)", message: error.localizedDescription)
-    }
-    
-    // MARK: Helper Methods for Handling Device Orientation & EXIF
-    
-    fileprivate func radiansForDegrees(_ degrees: CGFloat) -> CGFloat {
-        return CGFloat(Double(degrees) * Double.pi / 180.0)
-    }
-    
-    func exifOrientationForDeviceOrientation(_ deviceOrientation: UIDeviceOrientation) -> CGImagePropertyOrientation {
-        
-        switch deviceOrientation {
-        case .portraitUpsideDown:
-            return .rightMirrored
-            
-        case .landscapeLeft:
-            return .downMirrored
-            
-        case .landscapeRight:
-            return .upMirrored
-            
-        default:
-            return .leftMirrored
-        }
-    }
-    
-    func exifOrientationForCurrentDeviceOrientation() -> CGImagePropertyOrientation {
-        return exifOrientationForDeviceOrientation(UIDevice.current.orientation)
-    }
-    
-    // MARK: Performing Vision Requests
-    
-    /// - Tag: WriteCompletionHandler
-    fileprivate func prepareVisionRequest() {
-        
-        //self.trackingRequests = []
-        var requests = [VNTrackObjectRequest]()
-        
-        let faceDetectionRequest = VNDetectFaceRectanglesRequest(completionHandler: { (request, error) in
-            
-            if error != nil {
-                print("FaceDetection error: \(String(describing: error)).")
-            }
-            
-            guard let faceDetectionRequest = request as? VNDetectFaceRectanglesRequest,
-                let results = faceDetectionRequest.results as? [VNFaceObservation] else {
-                    return
-            }
-            DispatchQueue.main.async {
-                // Add the observations to the tracking list
-                for observation in results {
-                    let faceTrackingRequest = VNTrackObjectRequest(detectedObjectObservation: observation)
-                    requests.append(faceTrackingRequest)
-                }
-                self.trackingRequests = requests
-            }
-        })
-        
-        // Start with detection.  Find face, then track it.
-        self.detectionRequests = [faceDetectionRequest]
-        
-        self.sequenceRequestHandler = VNSequenceRequestHandler()
-        
-        self.setupVisionDrawingLayers()
-    }
-    
-    // MARK: Drawing Vision Observations
     
     fileprivate func setupVisionDrawingLayers() {
         let captureDeviceResolution = self.captureDeviceResolution
@@ -450,125 +675,5 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         self.updateLayerGeometry()
         
         CATransaction.commit()
-    }
-    
-    // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
-    /// - Tag: PerformRequests
-    // Handle delegate method callback on receiving a sample buffer.
-    public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        
-        var requestHandlerOptions: [VNImageOption: AnyObject] = [:]
-        
-        let cameraIntrinsicData = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil)
-        if cameraIntrinsicData != nil {
-            requestHandlerOptions[VNImageOption.cameraIntrinsics] = cameraIntrinsicData
-        }
-        
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            print("Failed to obtain a CVPixelBuffer for the current output frame.")
-            return
-        }
-        
-        let exifOrientation = self.exifOrientationForCurrentDeviceOrientation()
-        
-        guard let requests = self.trackingRequests, !requests.isEmpty else {
-            // No tracking object detected, so perform initial detection
-            let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                                            orientation: exifOrientation,
-                                                            options: requestHandlerOptions)
-            
-            do {
-                guard let detectRequests = self.detectionRequests else {
-                    return
-                }
-                try imageRequestHandler.perform(detectRequests)
-            } catch let error as NSError {
-                NSLog("Failed to perform FaceRectangleRequest: %@", error)
-            }
-            return
-        }
-        
-        do {
-            try self.sequenceRequestHandler.perform(requests,
-                                                     on: pixelBuffer,
-                                                     orientation: exifOrientation)
-        } catch let error as NSError {
-            NSLog("Failed to perform SequenceRequest: %@", error)
-        }
-        
-        // Setup the next round of tracking.
-        var newTrackingRequests = [VNTrackObjectRequest]()
-        for trackingRequest in requests {
-            
-            guard let results = trackingRequest.results else {
-                return
-            }
-            
-            guard let observation = results[0] as? VNDetectedObjectObservation else {
-                return
-            }
-            
-            if !trackingRequest.isLastFrame {
-                if observation.confidence > 0.3 {
-                    trackingRequest.inputObservation = observation
-                } else {
-                    trackingRequest.isLastFrame = true
-                }
-                newTrackingRequests.append(trackingRequest)
-            }
-        }
-        self.trackingRequests = newTrackingRequests
-        
-        if newTrackingRequests.isEmpty {
-            // Nothing to track, so abort.
-            return
-        }
-        
-        // Perform face landmark tracking on detected faces.
-        var faceLandmarkRequests = [VNDetectFaceLandmarksRequest]()
-        
-        // Perform landmark detection on tracked faces.
-        for trackingRequest in newTrackingRequests {
-            
-            let faceLandmarksRequest = VNDetectFaceLandmarksRequest(completionHandler: { (request, error) in
-                
-                if error != nil {
-                    print("FaceLandmarks error: \(String(describing: error)).")
-                }
-                
-                guard let landmarksRequest = request as? VNDetectFaceLandmarksRequest,
-                    let results = landmarksRequest.results as? [VNFaceObservation] else {
-                        return
-                }
-                
-                // Perform all UI updates (drawing) on the main queue, not the background queue on which this handler is being called.
-                DispatchQueue.main.async {
-                    self.drawFaceObservations(results)
-                }
-            })
-            
-            guard let trackingResults = trackingRequest.results else {
-                return
-            }
-            
-            guard let observation = trackingResults[0] as? VNDetectedObjectObservation else {
-                return
-            }
-            let faceObservation = VNFaceObservation(boundingBox: observation.boundingBox)
-            faceLandmarksRequest.inputFaceObservations = [faceObservation]
-            
-            // Continue to track detected facial landmarks.
-            faceLandmarkRequests.append(faceLandmarksRequest)
-            
-            let imageRequestHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                                            orientation: exifOrientation,
-                                                            options: requestHandlerOptions)
-            
-            do {
-                try imageRequestHandler.perform(faceLandmarkRequests)
-            } catch let error as NSError {
-                NSLog("Failed to perform FaceLandmarkRequest: %@", error)
-            }
-        }
     }
 }

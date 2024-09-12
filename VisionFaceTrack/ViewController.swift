@@ -24,10 +24,6 @@ class ViewController: UIViewController {
     var captureDevice: AVCaptureDevice?
     var captureDeviceResolution: CGSize = CGSize()
     
-    // Layer UI for drawing Vision results
-    var rootLayer: CALayer?
-    
-    
     // Vision requests
     private var detectionRequests: [VNDetectFaceRectanglesRequest]?
     
@@ -111,6 +107,7 @@ class ViewController: UIViewController {
             
             // set a delayed false here to perform face detection again
             DispatchQueue.main.asyncAfter(deadline: .now()+5, execute: {
+                print("Resetting face detection.")
                 self.didFindInitialFace = false
             })
             
@@ -333,7 +330,6 @@ extension ViewController:AVCaptureVideoDataOutputSampleBufferDelegate{
         videoPreviewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
         
         if let previewRootLayer = self.previewView?.layer {
-            self.rootLayer = previewRootLayer
             
             previewRootLayer.masksToBounds = true
             videoPreviewLayer.frame = previewRootLayer.bounds
